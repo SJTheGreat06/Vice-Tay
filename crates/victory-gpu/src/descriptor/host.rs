@@ -6436,6 +6436,7 @@ mod tests {
             MEMORY_MAPPED_VIEW_ADDRESS, PAGE_READWRITE,
         };
         if host().is_none() {
+            eprintln!("No D3D12 device for the texture alias check");
             return;
         }
         const PAGE: usize = 64 << 10;
@@ -6542,6 +6543,7 @@ mod tests {
         let due = first.texture_slots_due(55, 8).0;
         assert_eq!(due.len(), 1);
         assert_eq!(due[0].0, 2);
+        eprintln!("Both texture heaps observed the completed write through a mapped alias");
     }
 
     #[test]
