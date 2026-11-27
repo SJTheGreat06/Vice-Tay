@@ -57,15 +57,16 @@ pub(super) struct Placed {
     pub(super) len: usize,
     /// The destination's host copy.
     pub(super) shadow: std::sync::Arc<Shadow>,
+    /// The exact host copy the recorded GPU command reads from, if any.
+    source: Option<std::sync::Arc<Shadow>>,
     /// Upload memory the list copies from, to be given the source's bytes.
     from: Option<usize>,
 }
 
 impl Placed {
-    /// Whether this placed copy reads from CPU upload memory instead of a
-    /// source host copy on the card.
-    pub(super) fn reads_upload(&self) -> bool {
-        self.from.is_some()
+    /// Identity of the live source host copy. CPU upload memory has none.
+    pub(super) fn source_shadow(&self) -> Option<usize> {
+        self.source.as_ref().map(|source| std::sync::Arc::as_ptr(source) as usize)
     }
 
     /// Whether flights that write `written` are waited for.
@@ -298,6 +299,7 @@ impl HostList {
             src,
             len,
             shadow: to,
+            source: own,
             from: scratch.map(|s| s.2 as usize),
         }));
         deferred.title_written();

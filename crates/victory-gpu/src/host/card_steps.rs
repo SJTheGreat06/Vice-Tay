@@ -215,23 +215,35 @@ enum Does {
     /// A refresh of a host copy (named by its address).
     Refresh { shadow: usize, from: usize, to: usize },
     /// A copy that its list does on the card ([`place`]).
-    /// `from_cpu`: whether it copies from CPU upload memory rather than a
-    /// source host copy on the card.
-    Placed { dst: usize, src: usize, len: usize, from_cpu: bool },
+    /// `source_shadow`: the host copy the recorded command reads, or none
+    /// when it copies from upload memory.
+    Placed { dst: usize, src: usize, len: usize, source_shadow: Option<usize> },
     /// A shader dispatch/draw in the submission declares writes to `[from, to)`.
     GpuWrite { from: usize, to: usize },
     /// Anything, anywhere.
     Run,
 }
 
+/// The source range and host copy a fill must read for a placed copy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Redirect {
+    address: usize,
+    shadow: usize,
+}
+
+impl Redirect {
+    fn check_shadow(self, found: usize) -> Result<(), &'static str> {
+        if self.shadow == found { Ok(()) } else { Err("a redirected fill reads a different host copy") }
+    }
+}
+
 /// One step chosen by [`plan`]: index in `does`, execution level, and an
-/// optional redirected source address (for a fill reading through an earlier
-/// card-sourced placed copy in the same submission).
+/// optional redirect through an earlier card-sourced placed copy.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Planned {
     index: usize,
     level: u32,
-    redirect: Option<usize>,
+    redirect: Option<Redirect>,
 }
 
 fn meet(a: (usize, usize), b: (usize, usize)) -> bool {
@@ -327,9 +339,9 @@ fn plan(does: &[Does], stage: u32, by_order: bool, behind: &mut Option<(usize, u
     // the front list instead of refusing the whole submission — provided no
     // earlier placed copy or copy anywhere in the submission writes `P`'s
     // source, and no intervening step overwrites the fill's bytes.
-    let mut redirects: Vec<Option<usize>> = vec![None; does.len()];
+    let mut redirects = vec![None; does.len()];
     for (p, d) in does.iter().enumerate() {
-        if let Does::Placed { dst, src, len, from_cpu } = *d
+        if let Does::Placed { dst, src, len, source_shadow } = *d
             && (touched(&read, (dst, dst + len)) || touched(&written, (dst, dst + len)) || touched(&written, (src, src + len)))
         {
             let (to, from) = ((dst, dst + len), (src, src + len));
@@ -377,13 +389,16 @@ fn plan(does: &[Does], stage: u32, by_order: bool, behind: &mut Option<(usize, u
                     }
                     let inside = f_src >= dst && f_src + f_len <= dst + len;
                     let dst_clean_between = !writes_between.iter().any(|&w| meet(w, f_range));
-                    let ok = !from_cpu && inside && dst_clean_between && *src_checked.get_or_insert_with(src_clean);
-                    if !ok {
-                        *behind = Some((p, r));
-                        return Err(BEHIND_PLACED);
+                    if let Some(shadow) = source_shadow
+                        && inside
+                        && dst_clean_between
+                        && *src_checked.get_or_insert_with(src_clean)
+                    {
+                        redirects[r] = Some(Redirect { address: src + (f_src - dst), shadow });
+                        continue;
                     }
-                    redirects[r] = Some(src + (f_src - dst));
-                    continue;
+                    *behind = Some((p, r));
+                    return Err(BEHIND_PLACED);
                 }
                 match does[r] {
                     Does::Placed { dst: pd, len: pl, .. } => later_placed.push((pd, pd + pl)),
@@ -420,7 +435,7 @@ fn plan(does: &[Does], stage: u32, by_order: bool, behind: &mut Option<(usize, u
     let effective_rw = |i: usize| -> Option<((usize, usize), (usize, usize))> {
         let (r, w) = reads_writes(&does[i])?;
         let r = match redirects[i] {
-            Some(new_src) => (new_src, new_src + (r.1 - r.0)),
+            Some(Redirect { address, .. }) => (address, address + (r.1 - r.0)),
             None => r,
         };
         Some((r, w))
@@ -534,7 +549,7 @@ fn does_of(written: &[(usize, usize)], runs: &[&HostList]) -> (Vec<Does>, Vec<(u
                     to: *at + *len,
                 },
                 Step::RawCopy { .. } => Does::Run,
-                Step::Placed(p) => Does::Placed { dst: p.dst, src: p.src, len: p.len, from_cpu: p.reads_upload() },
+                Step::Placed(p) => Does::Placed { dst: p.dst, src: p.src, len: p.len, source_shadow: p.source_shadow() },
                 &Step::GpuWrite(_, address, len) if len > 0 => Does::GpuWrite { from: address, to: address + len },
                 Step::GpuWrite(..) | Step::Host(..) => continue,
             });
@@ -818,7 +833,7 @@ impl Host {
             if len == 0 {
                 return Err("nothing to read");
             }
-            let read_src = redirect.unwrap_or(src);
+            let read_src = redirect.map_or(src, |redirect| redirect.address);
             let from = match held.get(&(read_src, len)) {
                 Some(from) => from.clone(),
                 None => {
@@ -827,6 +842,12 @@ impl Host {
                     from
                 }
             };
+            // The shorter rebased range may resolve to a different host
+            // copy, or an in-flight writer may hold it through another copy.
+            // Only the resource encoded in the placed copy has its bytes.
+            if let Some(redirect) = redirect {
+                redirect.check_shadow(Arc::as_ptr(&from) as usize)?;
+            }
             let place = (Arc::as_ptr(&from) as usize, read_src, len, level);
             let at = match places.get(&place) {
                 Some(&at) => at,
@@ -1154,8 +1175,8 @@ mod tests {
     /// to the placed copy's source host copy when unchained.
     #[test]
     fn copies_at_their_place_stand_in_the_way_of_what_is_behind_them() {
-        let placed = Does::Placed { dst: 2000, src: 3000, len: 64, from_cpu: false };
-        let placed_cpu = Does::Placed { dst: 2000, src: 3000, len: 64, from_cpu: true };
+        let placed = Does::Placed { dst: 2000, src: 3000, len: 64, source_shadow: Some(3000) };
+        let placed_cpu = Does::Placed { dst: 2000, src: 3000, len: 64, source_shadow: None };
         let behind = |does: &[Does]| {
             let mut found = None;
             let refused = plan(does, 2, true, &mut found);
@@ -1172,7 +1193,7 @@ mod tests {
             plan(&[fill(2000, 8, true), placed, fill(2016, 16, true)], 2, true, &mut None),
             Ok(vec![
                 Planned { index: 0, level: 0, redirect: None },
-                Planned { index: 2, level: 0, redirect: Some(3016) },
+                Planned { index: 2, level: 0, redirect: Some(Redirect { address: 3016, shadow: 3000 }) },
             ])
         );
         // Without `by_order`, even a wholly-contained fill is still refused.
@@ -1180,25 +1201,25 @@ mod tests {
         // CPU-sourced placed copy: refused (no source host copy on the card).
         assert_eq!(behind(&[placed_cpu, fill(2000, 8, true)]), Some((0, 1)));
         // Chained placed copy (earlier placed or copy writes `placed.src`): refused.
-        let chain_placed = Does::Placed { dst: 3000, src: 4000, len: 64, from_cpu: false };
+        let chain_placed = Does::Placed { dst: 3000, src: 4000, len: 64, source_shadow: Some(4000) };
         assert_eq!(behind(&[chain_placed, placed, fill(2000, 8, true)]), Some((1, 2)));
         assert_eq!(behind(&[copy(3000, 5000, 8, false), placed, fill(2000, 8, true)]), Some((1, 2)));
         assert_eq!(behind(&[placed, fill(2000, 8, true), copy(3000, 5000, 8, false)]), Some((0, 1)));
         // Two placed copies to the same dst: fill wholly inside the newer one redirects to the newer source.
-        let placed2 = Does::Placed { dst: 2000, src: 4000, len: 64, from_cpu: false };
+        let placed2 = Does::Placed { dst: 2000, src: 4000, len: 64, source_shadow: Some(4000) };
         assert_eq!(
             plan(&[placed, placed2, fill(2008, 16, true)], 2, true, &mut None),
-            Ok(vec![Planned { index: 2, level: 0, redirect: Some(4008) }])
+            Ok(vec![Planned { index: 2, level: 0, redirect: Some(Redirect { address: 4008, shadow: 4000 }) }])
         );
         // Newer placed copy only partially covers the fill (split across two placed copies): refused.
-        let placed_half = Does::Placed { dst: 2000, src: 4000, len: 32, from_cpu: false };
+        let placed_half = Does::Placed { dst: 2000, src: 4000, len: 32, source_shadow: Some(4000) };
         assert_eq!(behind(&[placed, placed_half, fill(2000, 64, true)]), Some((0, 2)));
         // Shader write ahead of `placed` touching `placed.src`: refused (cannot read pre-dispatch bytes in front list).
         assert_eq!(behind(&[Does::GpuWrite { from: 3000, to: 3016 }, placed, fill(2000, 16, true)]), Some((1, 2)));
         // Shader write *after* `placed` touching `placed.src`: safe to redirect (front list runs before it).
         assert_eq!(
             plan(&[placed, Does::GpuWrite { from: 3000, to: 3016 }, fill(2000, 16, true)], 2, true, &mut None),
-            Ok(vec![Planned { index: 2, level: 0, redirect: Some(3000) }])
+            Ok(vec![Planned { index: 2, level: 0, redirect: Some(Redirect { address: 3000, shadow: 3000 }) }])
         );
         // Shader write between `placed` and `fill` touching `fill`'s range: refused.
         assert_eq!(behind(&[placed, Does::GpuWrite { from: 2008, to: 2024 }, fill(2000, 16, true)]), Some((0, 2)));
@@ -1214,7 +1235,7 @@ mod tests {
     /// boundary and later writes that cover the full fill range.
     #[test]
     fn placed_redirect_regression_cases() {
-        let placed = Does::Placed { dst: 2000, src: 3000, len: 64, from_cpu: false };
+        let placed = Does::Placed { dst: 2000, src: 3000, len: 64, source_shadow: Some(3000) };
         let fill_mid = fill(2016, 16, true);
         let expect_refused = |does: &[Does], label: &str| {
             let mut behind = None;
@@ -1236,25 +1257,25 @@ mod tests {
         expect_refused(&[placed, Does::GpuWrite { from: 2000, to: 2064 }, fill_mid], "later wide gpu write covers fill");
 
         // Later card-sourced placed copy covering the full fill: redirects to the newer source, not the older one.
-        let newer_exact = Does::Placed { dst: 2016, src: 4000, len: 16, from_cpu: false };
+        let newer_exact = Does::Placed { dst: 2016, src: 4000, len: 16, source_shadow: Some(4000) };
         assert_eq!(
             plan(&[placed, newer_exact, fill_mid], 2, true, &mut None),
-            Ok(vec![Planned { index: 2, level: 0, redirect: Some(4000) }])
+            Ok(vec![Planned { index: 2, level: 0, redirect: Some(Redirect { address: 4000, shadow: 4000 }) }])
         );
-        let newer_wide = Does::Placed { dst: 2000, src: 4000, len: 64, from_cpu: false };
+        let newer_wide = Does::Placed { dst: 2000, src: 4000, len: 64, source_shadow: Some(4000) };
         assert_eq!(
             plan(&[placed, newer_wide, fill_mid], 2, true, &mut None),
-            Ok(vec![Planned { index: 2, level: 0, redirect: Some(4016) }])
+            Ok(vec![Planned { index: 2, level: 0, redirect: Some(Redirect { address: 4016, shadow: 4000 }) }])
         );
 
         // Later placed copy covering the full fill whose source is invalid (CPU-sourced or written earlier): refused.
-        let newer_cpu = Does::Placed { dst: 2000, src: 4000, len: 64, from_cpu: true };
+        let newer_cpu = Does::Placed { dst: 2000, src: 4000, len: 64, source_shadow: None };
         expect_refused(&[placed, newer_cpu, fill_mid], "later cpu-sourced placed copy covers fill");
         expect_refused(
             &[Does::GpuWrite { from: 4000, to: 4064 }, placed, newer_wide, fill_mid],
             "later placed copy covers fill but its source was written earlier",
         );
-        let chain_for_newer = Does::Placed { dst: 4000, src: 6000, len: 64, from_cpu: false };
+        let chain_for_newer = Does::Placed { dst: 4000, src: 6000, len: 64, source_shadow: Some(6000) };
         expect_refused(
             &[chain_for_newer, placed, newer_wide, fill_mid],
             "later placed copy covers fill but is chained to an earlier placed copy",
@@ -1276,29 +1297,51 @@ mod tests {
         );
 
         // Split cover: a partial later `Placed` plus a `GpuWrite` covering the rest (either order): refused.
-        let newer_left = Does::Placed { dst: 2016, src: 4000, len: 8, from_cpu: false };
+        let newer_left = Does::Placed { dst: 2016, src: 4000, len: 8, source_shadow: Some(4000) };
         let gpu_right = Does::GpuWrite { from: 2024, to: 2032 };
         expect_refused(&[placed, newer_left, gpu_right, fill_mid], "split cover: partial placed then gpu write");
         expect_refused(&[placed, gpu_right, newer_left, fill_mid], "split cover: gpu write then partial placed");
 
         // Later `Placed` (after `placed`) writing `placed`'s source: allowed because the front list reads first.
-        let later_writes_src = Does::Placed { dst: 3000, src: 5000, len: 64, from_cpu: false };
+        let later_writes_src = Does::Placed { dst: 3000, src: 5000, len: 64, source_shadow: Some(5000) };
         assert_eq!(
             plan(&[placed, later_writes_src, fill_mid], 2, true, &mut None),
-            Ok(vec![Planned { index: 2, level: 0, redirect: Some(3016) }])
+            Ok(vec![Planned { index: 2, level: 0, redirect: Some(Redirect { address: 3016, shadow: 3000 }) }])
         );
 
         // Self-overlapping `Placed`: standalone redirect reads pre-copy source;
         // with the `GpuWrite(dst)` that `place_copy` declares ahead of it, refused.
-        let self_overlap = Does::Placed { dst: 2000, src: 2016, len: 64, from_cpu: false };
+        let self_overlap = Does::Placed { dst: 2000, src: 2016, len: 64, source_shadow: Some(2016) };
         assert_eq!(
             plan(&[self_overlap, fill(2000, 16, true)], 2, true, &mut None),
-            Ok(vec![Planned { index: 1, level: 0, redirect: Some(2016) }])
+            Ok(vec![Planned { index: 1, level: 0, redirect: Some(Redirect { address: 2016, shadow: 2016 }) }])
         );
         expect_refused(
             &[Does::GpuWrite { from: 2000, to: 2064 }, self_overlap, fill(2000, 16, true)],
             "self-overlapping placed copy preceded by declared dst gpu write",
         );
+    }
+
+    /// A shorter redirected fill can resolve to a nested host copy even
+    /// though the recorded placed copy reads the encompassing resource.
+    #[test]
+    fn placed_redirect_requires_the_recorded_source_shadow() {
+        let whole = Arc::new(0x1000..0x1100);
+        let nested = Arc::new(0x1040..0x1080);
+        let original = Arc::as_ptr(&whole) as usize;
+        let alias = Arc::as_ptr(&nested) as usize;
+        let placed = Does::Placed {
+            dst: 0x2000,
+            src: whole.start,
+            len: whole.end - whole.start,
+            source_shadow: Some(original),
+        };
+        let planned = plan(&[placed, fill(0x2040, 0x20, true)], 2, true, &mut None).unwrap();
+        let redirect = planned[0].redirect.unwrap();
+        assert_eq!(redirect.address, 0x1040);
+        assert!(whole.contains(&redirect.address) && nested.contains(&(redirect.address + 0x1f)));
+        assert!(redirect.check_shadow(original).is_ok());
+        assert!(redirect.check_shadow(alias).is_err());
     }
 
     /// Randomized equivalence check with `Does::Placed` and `Does::GpuWrite`:
@@ -1316,7 +1359,7 @@ mod tests {
                 .map(|_| {
                     let (a, b, len) = (random(40) as usize, random(40) as usize, 1 + random(8) as usize);
                     match random(7) {
-                        0..2 => Does::Placed { dst: a, src: b, len, from_cpu: random(5) == 0 },
+                        0..2 => Does::Placed { dst: a, src: b, len, source_shadow: (random(5) != 0).then_some(b) },
                         2..4 => fill(a, len, random(2) == 0),
                         4 => copy(a, b, len, random(3) == 0),
                         5 => Does::GpuWrite { from: a, to: a + len },
@@ -1375,7 +1418,7 @@ mod tests {
                 let before = mem.clone();
                 for &Planned { index, redirect, .. } in chosen.iter().filter(|p| p.level == level) {
                     let ((src, end), (dst, _)) = reads_writes(&does[index]).unwrap();
-                    let read_src = redirect.unwrap_or(src);
+                    let read_src = redirect.map_or(src, |redirect| redirect.address);
                     let len = end - src;
                     if redirect.is_some() || !has_gpu_write {
                         assert_eq!(
