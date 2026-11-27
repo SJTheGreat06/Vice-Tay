@@ -2381,6 +2381,7 @@ fn typed_d16_table_uav_roundtrip_uint_sint_and_float() {
         })
         .collect();
     let shader = build_table_typed_cs(&body, used);
+    assert_eq!(shader.half_views, [(0, 0), (0, 8)]);
     assert!(
         shader.root_srvs.contains(&super::SLOT_TABLE_STRIDES),
         "table typed d16 shader should request SLOT_TABLE_STRIDES"
@@ -2427,6 +2428,15 @@ fn typed_d16_table_uav_roundtrip_uint_sint_and_float() {
             .compute_pipeline(&shader)
             .unwrap_or_else(|e| panic!("{backend}: compute_pipeline failed: {e}"));
         for &(label, format, stride_word, input, base_slot) in &cases {
+            // Mirror the host's table rewrite for the specialized accesses.
+            // The resource contents and the original table metadata are retained.
+            let bound_format = |dword| {
+                if shader.half_views.contains(&(0, dword)) {
+                    DXGI_FORMAT_R16G16B16A16_UINT
+                } else {
+                    format
+                }
+            };
             let mut views = Vec::new();
             let mut strides = Vec::new();
             for _ in 0..base_slot {
@@ -2434,9 +2444,9 @@ fn typed_d16_table_uav_roundtrip_uint_sint_and_float() {
                 strides.push(0u32);
             }
             let uav_base = base_slot as usize;
-            views.push(View::TypedUav { data: input, format, elem_bytes: 8 });
+            views.push(View::TypedUav { data: input, format: bound_format(0), elem_bytes: 8 });
             strides.push(stride_word);
-            views.push(View::TypedUav { data: &zeros, format, elem_bytes: 8 });
+            views.push(View::TypedUav { data: &zeros, format: bound_format(8), elem_bytes: 8 });
             strides.push(stride_word);
             views.push(View::RawUav(8));
             strides.push(1);
