@@ -3399,6 +3399,21 @@ pub fn writing(at: usize, len: usize) {
     crate::descriptor::host::memory_written(at, len);
 }
 
+/// Open the guards before a copy we perform ourselves. Its texture notice
+/// must follow the copy, even if the copy only reaches part of the range.
+pub(crate) fn copying_to_title(at: usize, len: usize) -> TitleCopy {
+    open_for_write(at, len);
+    TitleCopy(at, len)
+}
+
+pub(crate) struct TitleCopy(usize, usize);
+
+impl Drop for TitleCopy {
+    fn drop(&mut self) {
+        crate::descriptor::host::memory_written(self.0, self.1);
+    }
+}
+
 /// A physical write reported once for each view by the runtime. It has
 /// already enumerated the aliases of the destination.
 pub fn title_page_view_written(at: usize, len: usize) {

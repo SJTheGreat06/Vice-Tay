@@ -6514,13 +6514,32 @@ mod tests {
         let new = second.texture_slots_due(u64::MAX, 8).0;
         second.texture_slot_done(3, new[0].1, None);
 
+        // Model a texture pass between opening the guards and finishing a
+        // copy. It can drain both heaps and see the old content in that gap.
+        let copying = crate::watch::copying_to_title(source + 17, payload.len());
+        assert_eq!(first.texture_slots_remapped(52), 0);
+        assert_eq!(second.texture_slots_remapped(52), 0);
+        let before = crate::texture::fingerprint(alias as u64, PAGE as u64);
+        let changed = [0x91, 0x22, 0x3f];
+        // SAFETY: a writable view of this test's section.
+        unsafe { std::ptr::copy_nonoverlapping(changed.as_ptr(), (source + 17) as *mut u8, changed.len()) };
+        assert_ne!(crate::texture::fingerprint(alias as u64, PAGE as u64), before);
+        drop(copying);
+        for (heap, slot) in [(&first, 1), (&second, 3)] {
+            assert_eq!(heap.texture_slots_remapped(52), 1);
+            let due = heap.texture_slots_due(53, 8).0;
+            assert_eq!(due.len(), 1);
+            assert_eq!(due[0].0, slot);
+            heap.texture_slot_done(slot, due[0].1, None);
+        }
+
         let writing = crate::kernel_writing(direct + 17, payload.len());
         // SAFETY: the guard above keeps the committed destination writable.
         unsafe { std::ptr::copy_nonoverlapping(payload.as_ptr(), (direct + 17) as *mut u8, payload.len()) };
         drop(writing);
-        assert_eq!(first.texture_slots_remapped(52), 1);
-        assert_eq!(second.texture_slots_remapped(52), 0);
-        let due = first.texture_slots_due(53, 8).0;
+        assert_eq!(first.texture_slots_remapped(54), 1);
+        assert_eq!(second.texture_slots_remapped(54), 0);
+        let due = first.texture_slots_due(55, 8).0;
         assert_eq!(due.len(), 1);
         assert_eq!(due[0].0, 2);
     }
