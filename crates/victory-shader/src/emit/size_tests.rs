@@ -474,6 +474,7 @@ fn build_stage(
         root_srvs: lowered.root_srvs.clone(),
         root_uavs: lowered.root_uavs.clone(),
         root_indexed_views: Vec::new(),
+        half_views: lowered.half_views.clone(),
     };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         v.validate(&mut shader.dxil.clone())
@@ -784,6 +785,7 @@ fn branched_buffer_size_read_as_number_compiles_with_view_clamp() {
                 root_srvs: l.root_srvs,
                 root_uavs: l.root_uavs,
                 root_indexed_views: Vec::new(),
+                half_views: l.half_views,
             }
         },
     );
